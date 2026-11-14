@@ -59,7 +59,12 @@
           </svg>
         </div>
         <div>
-          <h1 class="text-base font-bold tracking-tight text-white leading-tight">МОЙ ГАРДЕРОБ</h1>
+          <div class="flex items-center gap-2">
+            <h1 class="text-base font-bold tracking-tight text-white leading-tight">МОЙ ГАРДЕРОБ</h1>
+            <button id="wardrobeCloudBadge" type="button" onclick="forceCloudSync()" title="Нажми для синхронизации между ПК и телефоном" class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25 active:scale-95 transition">
+              ☁️ Облако ↻
+            </button>
+          </div>
           <p id="headerSubtitle" class="text-xs text-zinc-400">Архив образов • 0</p>
         </div>
       </div>
@@ -403,10 +408,11 @@
   </nav>
 
   <script>
-    // ==================== STATE & RELIABLE PERSISTENCE (INDEXEDDB + LOCALSTORAGE) ====================
-    // Никаких предзагруженных демо-луков — всё, что ты удаляешь или добавляешь, сохраняется навсегда.
+    // ==================== STATE & CROSS-DEVICE SYNC (TELEGRAM CLOUDSTORAGE + INDEXEDDB + LOCALSTORAGE) ====================
     const STORAGE_KEY_V2 = 'wardrobe_studio_tma_v2';
     const LEGACY_KEY_V1 = 'wardrobe_studio_tma_v1';
+    const WD_CLOUD_META = 'wd_sync_meta_v2';
+    const WD_CLOUD_CHUNK = 'wd_sync_c_';
     const DEMO_IDS = new Set(['outfit-1', 'outfit-2', 'wish-1', 'wish-2']);
 
     let state = {
@@ -417,13 +423,15 @@
       wishlistCategory: 'all',
       outfits: [],
       wishlist: [],
+      deletedIds: [],
       cardSlideIndex: {},
       activeDetailOutfitId: null,
       detailSlideIdx: 0,
       createMode: 'collage',
       collageSlots: { top: null, bottom: null, shoes: null, acc: null },
       directUploadedPhotos: [],
-      wishUploadedPhoto: null
+      wishUploadedPhoto: null,
+      isSyncingCloud: false
     };
 
     function initTelegramWebApp() {
@@ -434,6 +442,31 @@
           tg.expand();
         }
       } catch (e) {}
+    }
+
+    function getTelegramCloud() {
+      try {
+        const tg = window.Telegram && window.Telegram.WebApp;
+        if (tg && tg.CloudStorage && typeof tg.CloudStorage.setItem === 'function') {
+          if (!tg.isVersionAtLeast || tg.isVersionAtLeast('6.9')) {
+            return tg.CloudStorage;
+          }
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    function updateCloudBadgeUI(statusText) {
+      const btn = document.getElementById('wardrobeCloudBadge');
+      if (!btn) return;
+      if (statusText) {
+        btn.textContent = statusText;
+        return;
+      }
+      const hasCloud = Boolean(getTelegramCloud());
+      btn.textContent = hasCloud
+        ? `☁️ Облако (${state.outfits.length}) ↻`
+        : `💾 Локально (${state.outfits.length})`;
     }
 
     function openWardrobeDB() {
@@ -475,7 +508,6 @@
 
     function normalizeOutfit(o) {
       if (!o || typeof o !== 'object') return null;
-      // Собираем старые поля в единое поле comment, если пользователь мигрировал со старой версии
       let comment = typeof o.comment === 'string' ? o.comment : '';
       if (!comment && Array.isArray(o.comments) && o.comments.length) {
         comment = o.comments.map(c => c.text).filter(Boolean).join('\n');
@@ -486,75 +518,263 @@
         category: String(o.category || 'Повседневный'),
         createdAt: String(o.createdAt || ''),
         images: Array.isArray(o.images) ? o.images.filter(Boolean) : [],
-        comment: comment.trim()
+        comment: comment.trim(),
+        updatedAt: Number(o.updatedAt) || Date.now()
       };
     }
 
-    async function loadState() {
-      // 1. Сначала пробуем прочитать из IndexedDB (нет лимита 5 МБ на фото)
-      const idbData = await readFromIDB();
-      if (idbData && typeof idbData === 'object') {
-        state.outfits = Array.isArray(idbData.outfits)
-          ? idbData.outfits.filter(o => o && !DEMO_IDS.has(o.id)).map(normalizeOutfit).filter(Boolean)
-          : [];
-        state.wishlist = Array.isArray(idbData.wishlist)
-          ? idbData.wishlist.filter(w => w && !DEMO_IDS.has(w.id))
-          : [];
-        renderArchiveFeed();
-        renderWishlist();
-        return;
+    // Чистый ASCII JSON (1 символ = 1 байт), чтобы кириллица никогда не превышала лимит 4096 байт в Telegram CloudStorage
+    function toAsciiJson(obj) {
+      return JSON.stringify(obj).replace(/[\u007f-\uffff]/g, c =>
+        '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4)
+      );
+    }
+
+    // Сжимает изображение для облачной синхронизации между ноутбуком и телефоном (~15-22 КБ на фото)
+    function compressDataUrlForCloud(dataUrl, maxDim = 420, quality = 0.58) {
+      return new Promise((resolve) => {
+        if (!dataUrl || !dataUrl.startsWith('data:image')) return resolve(dataUrl || '');
+        const img = new Image();
+        img.onload = () => {
+          let w = img.width;
+          let h = img.height;
+          if (w > maxDim || h > maxDim) {
+            if (w > h) {
+              h = Math.round((h * maxDim) / w);
+              w = maxDim;
+            } else {
+              w = Math.round((w * maxDim) / h);
+              h = maxDim;
+            }
+          }
+          const c = document.createElement('canvas');
+          c.width = w;
+          c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          resolve(c.toDataURL('image/jpeg', quality));
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+      });
+    }
+
+    function cloudSetItemAsync(cloud, key, val) {
+      return new Promise((resolve) => {
+        try {
+          cloud.setItem(key, val, (err) => resolve(!err));
+        } catch (e) {
+          resolve(false);
+        }
+      });
+    }
+
+    async function pushStateToTelegramCloud() {
+      const cloud = getTelegramCloud();
+      if (!cloud || state.isSyncingCloud) return;
+      state.isSyncingCloud = true;
+      updateCloudBadgeUI('☁️ Сохранение...');
+
+      try {
+        // Готовим облегченные копии фото для облака Telegram, чтобы мгновенно пролетали между ноутбуком и телефоном
+        const cloudOutfits = [];
+        for (const o of state.outfits) {
+          const compressedImgs = [];
+          for (const imgSrc of (o.images || []).slice(0, 4)) {
+            compressedImgs.push(await compressDataUrlForCloud(imgSrc, 420, 0.58));
+          }
+          cloudOutfits.push({
+            ...o,
+            images: compressedImgs
+          });
+        }
+
+        const cloudWishlist = [];
+        for (const w of state.wishlist) {
+          cloudWishlist.push({
+            ...w,
+            image: w.image ? await compressDataUrlForCloud(w.image, 360, 0.56) : ''
+          });
+        }
+
+        const cloudPayload = toAsciiJson({
+          outfits: cloudOutfits,
+          wishlist: cloudWishlist,
+          deletedIds: state.deletedIds.slice(-200),
+          updatedAt: Date.now()
+        });
+
+        const chunkSize = 3500;
+        const totalChunks = Math.ceil(cloudPayload.length / chunkSize);
+
+        for (let i = 0; i < totalChunks; i++) {
+          const slice = cloudPayload.slice(i * chunkSize, (i + 1) * chunkSize);
+          await cloudSetItemAsync(cloud, `${WD_CLOUD_CHUNK}${i}`, slice);
+        }
+
+        await cloudSetItemAsync(
+          cloud,
+          WD_CLOUD_META,
+          JSON.stringify({ count: totalChunks, outfitsCount: cloudOutfits.length, updatedAt: Date.now() })
+        );
+        updateCloudBadgeUI(`☁️ Облако (${state.outfits.length}) ✓`);
+      } catch (e) {
+        updateCloudBadgeUI();
+      } finally {
+        state.isSyncingCloud = false;
+      }
+    }
+
+    function pullStateFromTelegramCloud() {
+      return new Promise((resolve) => {
+        const cloud = getTelegramCloud();
+        if (!cloud) return resolve(null);
+
+        try {
+          cloud.getItem(WD_CLOUD_META, (err, metaRaw) => {
+            if (err || !metaRaw) return resolve(null);
+            let meta;
+            try {
+              meta = JSON.parse(metaRaw);
+            } catch (e) {
+              return resolve(null);
+            }
+            const count = Number(meta && meta.count) || 0;
+            if (count <= 0) return resolve({ outfits: [], wishlist: [], deletedIds: [] });
+
+            // Загружаем чанки пачками по 50 ключей
+            const allKeys = [];
+            for (let i = 0; i < count; i++) {
+              allKeys.push(`${WD_CLOUD_CHUNK}${i}`);
+            }
+
+            cloud.getItems(allKeys, (err2, values) => {
+              if (err2 || !values) return resolve(null);
+              let joined = '';
+              for (let i = 0; i < count; i++) {
+                joined += values[`${WD_CLOUD_CHUNK}${i}`] || '';
+              }
+              try {
+                const parsed = JSON.parse(joined);
+                resolve(parsed && typeof parsed === 'object' ? parsed : null);
+              } catch (e) {
+                resolve(null);
+              }
+            });
+          });
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    }
+
+    function mergeById(localList, cloudList, deletedSet, isOutfit = false) {
+      const map = new Map();
+      // Сначала кладем облачные элементы (с ноутбука/телефона)
+      (cloudList || []).forEach(item => {
+        if (!item || !item.id || DEMO_IDS.has(item.id) || deletedSet.has(item.id)) return;
+        const norm = isOutfit ? normalizeOutfit(item) : item;
+        if (norm) map.set(norm.id, norm);
+      });
+      // Затем сверяем с локальными (если локально есть фото в более высоком разрешении и запись не старее — сохраняем высокое разрешение)
+      (localList || []).forEach(item => {
+        if (!item || !item.id || DEMO_IDS.has(item.id) || deletedSet.has(item.id)) return;
+        const norm = isOutfit ? normalizeOutfit(item) : item;
+        if (!norm) return;
+        const existing = map.get(norm.id);
+        if (!existing) {
+          map.set(norm.id, norm);
+        } else {
+          const localTime = Number(norm.updatedAt) || 0;
+          const cloudTime = Number(existing.updatedAt) || 0;
+          const base = localTime >= cloudTime ? norm : existing;
+          // Оставляем более четкие локальные фото, если количество слайдов совпадает
+          if (isOutfit && (norm.images || []).length === (existing.images || []).length && (norm.images[0] || '').length > (existing.images[0] || '').length) {
+            base.images = norm.images;
+          }
+          map.set(norm.id, base);
+        }
+      });
+      return Array.from(map.values());
+    }
+
+    async function loadState(showSyncToast = false) {
+      let localData = await readFromIDB();
+
+      if (!localData) {
+        try {
+          const rawV2 = localStorage.getItem(STORAGE_KEY_V2);
+          if (rawV2) localData = JSON.parse(rawV2);
+        } catch (e) {}
       }
 
-      // 2. Если в IndexedDB пусто, проверяем localStorage v2
+      if (!localData) {
+        try {
+          const rawV1 = localStorage.getItem(LEGACY_KEY_V1);
+          if (rawV1) {
+            localData = JSON.parse(rawV1);
+            localStorage.removeItem(LEGACY_KEY_V1);
+          }
+        } catch (e) {}
+      }
+
+      const localOutfits = localData && Array.isArray(localData.outfits) ? localData.outfits : [];
+      const localWishlist = localData && Array.isArray(localData.wishlist) ? localData.wishlist : [];
+      const localDeleted = localData && Array.isArray(localData.deletedIds) ? localData.deletedIds : [];
+
+      // Опрашиваем облако Telegram (для синхронизации между ноутбуком и телефоном)
+      const cloudData = await pullStateFromTelegramCloud();
+      const cloudOutfits = cloudData && Array.isArray(cloudData.outfits) ? cloudData.outfits : [];
+      const cloudWishlist = cloudData && Array.isArray(cloudData.wishlist) ? cloudData.wishlist : [];
+      const cloudDeleted = cloudData && Array.isArray(cloudData.deletedIds) ? cloudData.deletedIds : [];
+
+      const deletedSet = new Set([...DEMO_IDS, ...localDeleted, ...cloudDeleted]);
+      state.deletedIds = Array.from(deletedSet);
+
+      state.outfits = mergeById(localOutfits, cloudOutfits, deletedSet, true);
+      state.wishlist = mergeById(localWishlist, cloudWishlist, deletedSet, false);
+
+      // Сохраняем объединенное состояние локально
+      const mergedPayload = {
+        outfits: state.outfits,
+        wishlist: state.wishlist,
+        deletedIds: state.deletedIds,
+        updatedAt: Date.now()
+      };
+      writeToIDB(mergedPayload);
       try {
-        const rawV2 = localStorage.getItem(STORAGE_KEY_V2);
-        if (rawV2) {
-          const parsed = JSON.parse(rawV2);
-          state.outfits = Array.isArray(parsed.outfits)
-            ? parsed.outfits.filter(o => o && !DEMO_IDS.has(o.id)).map(normalizeOutfit).filter(Boolean)
-            : [];
-          state.wishlist = Array.isArray(parsed.wishlist)
-            ? parsed.wishlist.filter(w => w && !DEMO_IDS.has(w.id))
-            : [];
-          await writeToIDB({ outfits: state.outfits, wishlist: state.wishlist });
-          renderArchiveFeed();
-          renderWishlist();
-          return;
-        }
+        localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(mergedPayload));
       } catch (e) {}
 
-      // 3. Миграция только пользовательских вещей из v1 (все демо outfit-1, outfit-2, wish-1, wish-2 отсекаются навсегда)
-      try {
-        const rawV1 = localStorage.getItem(LEGACY_KEY_V1);
-        if (rawV1) {
-          const parsedV1 = JSON.parse(rawV1);
-          state.outfits = Array.isArray(parsedV1.outfits)
-            ? parsedV1.outfits.filter(o => o && !DEMO_IDS.has(o.id)).map(normalizeOutfit).filter(Boolean)
-            : [];
-          state.wishlist = Array.isArray(parsedV1.wishlist)
-            ? parsedV1.wishlist.filter(w => w && !DEMO_IDS.has(w.id))
-            : [];
-          localStorage.removeItem(LEGACY_KEY_V1);
-        }
-      } catch (e) {}
+      // Если на этом устройстве были образы, которых еще нет в облаке — отправляем их в облако
+      if (state.outfits.length > cloudOutfits.length || state.wishlist.length > cloudWishlist.length) {
+        pushStateToTelegramCloud();
+      } else {
+        updateCloudBadgeUI();
+      }
 
-      saveState();
       renderArchiveFeed();
       renderWishlist();
+      if (showSyncToast) {
+        showToast(`Синхронизировано: образов ${state.outfits.length}`);
+      }
+    }
+
+    function forceCloudSync() {
+      loadState(true);
     }
 
     function saveState() {
       const payload = {
         outfits: state.outfits,
         wishlist: state.wishlist,
+        deletedIds: state.deletedIds,
         updatedAt: Date.now()
       };
-      // Сохраняем в IndexedDB (гарантированно вмещает десятки МБ фотографий)
       writeToIDB(payload);
-      // Дублируем в localStorage
       try {
         localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(payload));
       } catch (e) {}
+      pushStateToTelegramCloud();
     }
 
     function showToast(msg) {
@@ -804,6 +1024,7 @@
       const newTitle = (document.getElementById('detailTitleInput').value || '').trim();
       if (newTitle) outfit.title = newTitle;
       outfit.comment = (document.getElementById('detailCommentInput').value || '').trim();
+      outfit.updatedAt = Date.now();
       saveState();
       renderArchiveFeed();
       closeOutfitDetailModal();
@@ -811,11 +1032,14 @@
     }
 
     function deleteOutfit(outfitId) {
+      if (!state.deletedIds.includes(outfitId)) {
+        state.deletedIds.push(outfitId);
+      }
       state.outfits = state.outfits.filter(o => o.id !== outfitId);
       saveState();
       closeOutfitDetailModal();
       renderArchiveFeed();
-      showToast('Образ удален');
+      showToast('Образ удален на всех устройствах');
     }
 
     function appendPhotosToActiveOutfit(event) {
@@ -1258,6 +1482,9 @@
     }
 
     function deleteWishItem(id) {
+      if (!state.deletedIds.includes(id)) {
+        state.deletedIds.push(id);
+      }
       state.wishlist = state.wishlist.filter(i => i.id !== id);
       saveState();
       renderWishlist();
@@ -1304,10 +1531,18 @@
         .replace(/"/g, '&quot;');
     }
 
-    // ==================== INIT ====================
+    // ==================== INIT & AUTO MOBILE SYNC ====================
     window.addEventListener('DOMContentLoaded', () => {
       initTelegramWebApp();
-      loadState();
+      loadState(false);
+      setTimeout(() => loadState(false), 800);
+      setTimeout(() => loadState(false), 2200);
+
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+          loadState(false);
+        }
+      });
     });
   </script>
 </body>
